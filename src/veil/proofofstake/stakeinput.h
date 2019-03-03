@@ -44,13 +44,13 @@ class ZerocoinStake : public CStakeInput
 private:
     uint256 nChecksum;
     bool fMint;
-    uint256 hashSerial;
+    uint256 hashStake;
 
 public:
-    explicit ZerocoinStake(libzerocoin::CoinDenomination denom, const uint256& hashSerial)
+    explicit ZerocoinStake(libzerocoin::CoinDenomination denom, const uint256& hashStake)
     {
         this->denom = denom;
-        this->hashSerial = hashSerial;
+        this->hashStake = hashStake;
         this->pindexFrom = nullptr;
         fMint = true;
     }
@@ -69,6 +69,7 @@ public:
     int GetChecksumHeightFromMint();
     int GetChecksumHeightFromSpend();
     uint256 GetChecksum();
+    uint256 GetSerialStakeHash();
 
     static int HeightToModifierHeight(int nHeight);
 };
