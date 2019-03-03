@@ -536,7 +536,7 @@ static CTransactionRef SendMoney(CWallet * const pwallet, const CTxDestination &
         throw JSONRPCError(RPC_WALLET_ERROR, strError);
     }
     CValidationState state;
-    if (!pwallet->CommitTransaction(tx, std::move(mapValue), {} /* orderForm */, reservekey, g_connman.get(), state)) {
+    if (!pwallet->CommitTransaction(tx, std::move(mapValue), {} /* orderForm */, &reservekey, g_connman.get(), state)) {
         strError = strprintf("Error: The transaction was rejected! Reason given: %s", FormatStateMessage(state));
         throw JSONRPCError(RPC_WALLET_ERROR, strError);
     }
@@ -1369,7 +1369,7 @@ static UniValue sendmany(const JSONRPCRequest& request)
     if (!fCreated)
         throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, strFailReason);
     CValidationState state;
-    if (!pwallet->CommitTransaction(tx, std::move(mapValue), {} /* orderForm */, keyChange, g_connman.get(), state)) {
+    if (!pwallet->CommitTransaction(tx, std::move(mapValue), {} /* orderForm */, &keyChange, g_connman.get(), state)) {
         strFailReason = strprintf("Transaction commit failed:: %s", FormatStateMessage(state));
         throw JSONRPCError(RPC_WALLET_ERROR, strFailReason);
     }
@@ -2466,6 +2466,7 @@ static UniValue gettransaction(const JSONRPCRequest& request)
                 auto bnSerial = spend->getCoinSerialNumber();
                 obj_vin.pushKV("serial", bnSerial.GetHex());
                 obj_vin.pushKV("serial_hash", GetSerialHash(bnSerial).GetHex());
+                obj_vin.pushKV("denom", (int64_t)spend->getDenomination());
             }
         } else {
             //Have to specifically look up type to determine whether it is CT or Basecoin

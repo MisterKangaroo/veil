@@ -1790,6 +1790,8 @@ int AnonWallet::AddStandardInputs_Inner(CWalletTx &wtx, CTransactionRecord &rtx,
             wtx.fFromMe = true;
 
             CAmount nValueToSelect = nValueOutCT;
+            if (!fZerocoinInputs)
+                nValueToSelect += nValueOutZerocoin;
             if (nSubtractFeeFromAmount == 0) {
                 nValueToSelect += nFeeRet;
             }
@@ -1882,7 +1884,7 @@ int AnonWallet::AddStandardInputs_Inner(CWalletTx &wtx, CTransactionRecord &rtx,
 
             int nLastBlindedOutput = -1;
 
-            if (!fOnlyStandardOutputs) {
+            if (!fOnlyStandardOutputs || nZerocoinMintOuts) {
                 OUTPUT_PTR<CTxOutData> outFee = MAKE_OUTPUT<CTxOutData>();
                 outFee->vData.push_back(DO_FEE);
                 outFee->vData.resize(9); // More bytes than varint fee could use
@@ -2103,7 +2105,7 @@ int AnonWallet::AddStandardInputs_Inner(CWalletTx &wtx, CTransactionRecord &rtx,
 
         coinControl->nChangePos = nChangePosInOut;
 
-        if (!fOnlyStandardOutputs) {
+        if (!fOnlyStandardOutputs || nZerocoinMintOuts) {
             std::vector<uint8_t> &vData = ((CTxOutData*)txNew.vpout[0].get())->vData;
             vData.resize(1);
             if (0 != PutVarInt(vData, nFeeRet)) {
@@ -2211,6 +2213,25 @@ int AnonWallet::AddStandardInputs(CWalletTx &wtx, CTransactionRecord &rtx, std::
     }
 
     return 0;
+}
+
+bool AnonWallet::MakeSigningKeystore(CBasicKeyStore& keystore, const CScript& scriptPubKey)
+{
+    CTxDestination dest;
+    if (!ExtractDestination(scriptPubKey, dest))
+        return error("%s: Failed to extract destination", __func__);
+
+    if (dest.type() != typeid(CKeyID))
+        return error("%s: Destination is not type keyid", __func__);
+
+    CKey key;
+    CKeyID keyID = boost::get<CKeyID>(dest);
+    if (!GetKey(keyID, key))
+        return error("%s: Failed to fetch key", __func__);
+
+    keystore.AddKey(key);
+
+    return true;
 }
 
 int AnonWallet::AddBlindedInputs_Inner(CWalletTx &wtx, CTransactionRecord &rtx, std::vector<CTempRecipient> &vecSend,
@@ -2417,14 +2438,18 @@ int AnonWallet::AddBlindedInputs_Inner(CWalletTx &wtx, CTransactionRecord &rtx, 
                 const uint256 &txhash = coin.first->first;
                 const COutputRecord *oR = coin.first->second.GetOutput(coin.second);
                 const CScript &scriptPubKey = oR->scriptPubKey;
-                SignatureData sigdata;
+
+                CBasicKeyStore keystore;
+                if (!MakeSigningKeystore(keystore, scriptPubKey))
+                    return wserrorN(1, sError, __func__, "Could not locate signing key");
 
                 // Use witness size estimate if set
                 COutPoint prevout(txhash, coin.second);
                 std::map<COutPoint, CInputData>::const_iterator it = coinControl->m_inputData.find(prevout);
+                SignatureData sigdata;
                 if (it != coinControl->m_inputData.end()) {
                     sigdata.scriptWitness = it->second.scriptWitness;
-                } else if (!ProduceSignature(*pwalletParent, DUMMY_SIGNATURE_CREATOR, scriptPubKey, sigdata)) {
+                } else if (!ProduceSignature(keystore, DUMMY_SIGNATURE_CREATOR, scriptPubKey, sigdata)) {
                     return wserrorN(1, sError, __func__, "Dummy signature failed.");
                 }
                 UpdateInput(txNew.vin[nIn], sigdata);
@@ -2630,6 +2655,10 @@ int AnonWallet::AddBlindedInputs_Inner(CWalletTx &wtx, CTransactionRecord &rtx, 
 
                 const CScript &scriptPubKey = outputRecord->scriptPubKey;
 
+                CBasicKeyStore keystore;
+                if (!MakeSigningKeystore(keystore, scriptPubKey))
+                    return wserrorN(1, sError, __func__, "Could not locate signing key");
+
                 CStoredTransaction stx;
                 if (!AnonWalletDB(*walletDatabase).ReadStoredTx(txhash, stx)) {
                     return werrorN(1, "%s: ReadStoredTx failed for %s.\n", __func__, txhash.ToString().c_str());
@@ -2639,7 +2668,7 @@ int AnonWallet::AddBlindedInputs_Inner(CWalletTx &wtx, CTransactionRecord &rtx, 
 
                 SignatureData sigdata;
 
-                if (!ProduceSignature(*pwalletParent, MutableTransactionSignatureCreator(&txNew, nIn, vchAmount, SIGHASH_ALL), scriptPubKey, sigdata))
+                if (!ProduceSignature(keystore, MutableTransactionSignatureCreator(&txNew, nIn, vchAmount, SIGHASH_ALL), scriptPubKey, sigdata))
                     return wserrorN(1, sError, __func__, _("Signing transaction failed"));
                 UpdateInput(txNew.vin[nIn], sigdata);
 

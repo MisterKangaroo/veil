@@ -3868,7 +3868,7 @@ bool CWallet::SelectStakeCoins(std::list<std::unique_ptr<CStakeInput> >& listInp
  * Call after CreateTransaction unless you want to abort
  */
 bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm,
-        CReserveKey& reservekey, CConnman* connman, CValidationState& state)
+        CReserveKey* reservekey, CConnman* connman, CValidationState& state)
 {
     {
         LOCK2(cs_main, cs_wallet);
@@ -3884,8 +3884,8 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
         LogPrintf("CommitTransaction:\n%s", wtxNew.tx->ToString()); /* Continued */
         {
             // Take key pair from key pool so it won't be used again
-            reservekey.KeepKey();
-
+            if (reservekey)
+                reservekey->KeepKey();
 
             if (wtxNew.tx->HasBlindedValues())
                 setAnonTx.emplace(wtxNew.tx->GetHash());
@@ -3915,8 +3915,7 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
 
         // Broadcast
         if (!wtx.AcceptToMemoryPool(maxTxFee, state)) {
-            LogPrintf("CommitTransaction(): Transaction cannot be broadcast immediately, %s\n", FormatStateMessage(state));
-            // TODO: if we expect the failure to be long term or permanent, instead delete wtx from the wallet and return failure.
+            return error("CommitTransaction(): Transaction cannot be broadcast immediately, %s\n", FormatStateMessage(state));
         } else {
             wtx.RelayWalletTransaction(connman);
         }
@@ -4800,20 +4799,28 @@ void CWallet::AutoZeromint()
             nToMintAmount = nPreferredDenom;  // Enough coins => mint preferred denomination
         else
             nToMintAmount = 0;                // Not enough coins => do nothing and wait for more coins
-    }
 
-    if (nToMintAmount >= ZQ_11110){
-        nMintAmount = ZQ_11110;
-    } else if (nToMintAmount >= libzerocoin::CoinDenomination::ZQ_TEN_THOUSAND){
-        nMintAmount = libzerocoin::CoinDenomination::ZQ_TEN_THOUSAND;
-    } else if (nToMintAmount >= libzerocoin::CoinDenomination::ZQ_ONE_THOUSAND){
-        nMintAmount = libzerocoin::CoinDenomination::ZQ_ONE_THOUSAND;
-    } else if (nToMintAmount >= libzerocoin::CoinDenomination::ZQ_ONE_HUNDRED){
-        nMintAmount = libzerocoin::CoinDenomination::ZQ_ONE_HUNDRED;
-    } else if (nToMintAmount >= libzerocoin::CoinDenomination::ZQ_TEN){
-        nMintAmount = libzerocoin::CoinDenomination::ZQ_TEN;
-    } else {
-        nMintAmount = 0;
+        // Only one denom per cycle
+        if (nToMintAmount >= ZQ_11110){
+            nMintAmount = ZQ_11110;
+        } else if (nToMintAmount >= libzerocoin::CoinDenomination::ZQ_TEN_THOUSAND){
+            nMintAmount = libzerocoin::CoinDenomination::ZQ_TEN_THOUSAND;
+        } else if (nToMintAmount >= libzerocoin::CoinDenomination::ZQ_ONE_THOUSAND){
+            nMintAmount = libzerocoin::CoinDenomination::ZQ_ONE_THOUSAND;
+        } else if (nToMintAmount >= libzerocoin::CoinDenomination::ZQ_ONE_HUNDRED){
+            nMintAmount = libzerocoin::CoinDenomination::ZQ_ONE_HUNDRED;
+        } else if (nToMintAmount >= libzerocoin::CoinDenomination::ZQ_TEN){
+            nMintAmount = libzerocoin::CoinDenomination::ZQ_TEN;
+        } else {
+            nMintAmount = 0;
+        }
+
+    }else{
+        // nPreferredDenom is -1 when the automatic full mint is selected
+        if(nPreferredDenom == -1){
+            nMintAmount = nBalance;
+        } else
+            nMintAmount = 0;
     }
 
     if (nMintAmount > 0){
@@ -5621,7 +5628,7 @@ string CWallet::MintZerocoin(CAmount nValue, CWalletTx& wtxNew, vector<CDetermin
     string strError;
     CMutableTransaction txNew;
     std::vector<CTempRecipient> vecSend;
-    if (!CreateZerocoinMintTransaction(nValue, txNew, vDMints, &reserveKey, nFeeRequired, strError, vecSend, inputtype, coinControl)) {
+    if (!CreateZerocoinMintTransaction(nValue, txNew, vDMints, nFeeRequired, strError, vecSend, inputtype, coinControl)) {
         if (nValue + nFeeRequired > GetBalance())
             return strprintf(_("Error: Failed to create transaction: %s"), strError);
         return strError;
@@ -5641,7 +5648,7 @@ string CWallet::MintZerocoin(CAmount nValue, CWalletTx& wtxNew, vector<CDetermin
     //commit the transaction to the network
     CValidationState state;
     mapValue_t mapValue;
-    if (!CommitTransaction(wtxNew.tx, std::move(mapValue), {}, reserveKey, g_connman.get(), state)) {
+    if (!CommitTransaction(wtxNew.tx, std::move(mapValue), {}, &reserveKey, g_connman.get(), state)) {
         return _("Error: The transaction was rejected! This might happen if some of the coins in your wallet were already "
                  "spent, such as if you used a copy of wallet.dat and coins were spent in the copy but not marked as spent here.");
     } else {
@@ -5676,6 +5683,18 @@ bool CWallet::SpendZerocoin(CAmount nValue, int nSecurityLevel, CZerocoinSpendRe
         std::vector<CZerocoinMint>& vMintsSelected, bool fMintChange, bool fMinimizeChange,
         libzerocoin::CoinDenomination denomFilter, CTxDestination* addressTo)
 {
+    std::vector<CommitData> vCommitData;
+    if (!PrepareZerocoinSpend(nValue, nSecurityLevel, receipt, vMintsSelected, fMintChange, fMinimizeChange,
+            vCommitData, denomFilter, addressTo))
+        return false;
+
+    return CommitZerocoinSpend(receipt, vCommitData);
+}
+
+bool CWallet::PrepareZerocoinSpend(CAmount nValue, int nSecurityLevel, CZerocoinSpendReceipt& receipt,
+                            std::vector<CZerocoinMint>& vMintsSelected, bool fMintChange, bool fMinimizeChange,
+                            std::vector<CommitData>& vCommitData, libzerocoin::CoinDenomination denomFilter, CTxDestination* addressTo)
+{
     // Default: assume something goes wrong. Depending on the problem this gets more specific below
     int nStatus = ZSPEND_ERROR;
 
@@ -5692,9 +5711,6 @@ bool CWallet::SpendZerocoin(CAmount nValue, int nSecurityLevel, CZerocoinSpendRe
     }
 
     // todo: should we use a different reserve key for each transaction?
-    CReserveKey reserveKey(this);
-    std::vector<std::tuple<CWalletTx, std::vector<CDeterministicMint>, std::vector<CZerocoinMint>>> vCommitData;
-
     const int nMaxSpends = Params().Zerocoin_MaxSpendsPerTransaction(); // Maximum possible spends for one z transaction
     CAmount nRemainingValue = nValue;
     for (auto start = 0; start < vMintsSelected.size(); start += nMaxSpends) {
@@ -5712,15 +5728,14 @@ bool CWallet::SpendZerocoin(CAmount nValue, int nSecurityLevel, CZerocoinSpendRe
 
         std::vector<CDeterministicMint> vCurNewMints;
         CWalletTx wtxCurrent(this, nullptr);
-
-        if (!CreateZerocoinSpendTransaction(nBatchValue, nSecurityLevel, wtxCurrent, reserveKey, receipt,
-                vBatchMints, vCurNewMints, fMintChange, fMinimizeChange, addressTo)) {
+        if (!CreateZerocoinSpendTransaction(nBatchValue, nSecurityLevel, wtxCurrent, receipt,
+                                            vBatchMints, vCurNewMints, fMintChange, fMinimizeChange, addressTo)) {
             return false;
         }
         CValidationState state;
         LOCK(cs_main);
         if (!AcceptToMemoryPool(mempool, state, wtxCurrent.tx, nullptr /* pfMissingInputs */, nullptr /* plTxnReplaced */,
-                false /* bypass_limits */, maxTxFee, true)) {
+                                false /* bypass_limits */, maxTxFee, true)) {
             // failed mempool validation for one of the transactions so no partial transaction is being committed
             return false;
         }
@@ -5732,9 +5747,16 @@ bool CWallet::SpendZerocoin(CAmount nValue, int nSecurityLevel, CZerocoinSpendRe
     if (fMintChange && fBackupMints)
         ZBackupWallet();
 
+    receipt.SetStatus("Preparation Successful", ZSPEND_PREPARED);  // When we reach this point the preparation was successful
+    return true;
+}
+
+bool CWallet::CommitZerocoinSpend(CZerocoinSpendReceipt& receipt, std::vector<CommitData>& vCommitData)
+{
     WalletBatch walletdb(*this->database);
     CValidationState state;
     mapValue_t mapValue;
+    int nStatus = ZSPEND_ERROR;
 
     std::vector<CTransactionRef> vtx = receipt.GetTransactions();
     for (unsigned int i = 0; i < vCommitData.size(); i++) {
@@ -5748,7 +5770,8 @@ bool CWallet::SpendZerocoin(CAmount nValue, int nSecurityLevel, CZerocoinSpendRe
             error("%s: FIXME: vtx size does not match expected value!! vtx %d i=%d", __func__, vtx.size(), i);
             fTxFail = true;
         }
-        if (fTxFail || !CommitTransaction(vtx[i], {}, {}, reserveKey, g_connman.get(), state)) {
+
+        if (fTxFail || !CommitTransaction(vtx[i], {}, {}, /*CReserveKey*/nullptr, g_connman.get(), state)) {
             LogPrintf("%s: failed to commit\n", __func__);
             nStatus = ZCOMMIT_FAILED;
 
@@ -5756,7 +5779,6 @@ bool CWallet::SpendZerocoin(CAmount nValue, int nSecurityLevel, CZerocoinSpendRe
             for (const CZerocoinMint& mint : vNewSelectedMints) {
                 uint256 hashPubcoin = GetPubCoinHash(mint.GetValue());
                 zTracker->SetPubcoinNotUsed(hashPubcoin);
-                // todo: this->NotifyZerocoinChanged(this, mint.GetValue().GetHex(), "New", CT_UPDATED);
             }
 
             //erase spends
@@ -5805,7 +5827,7 @@ bool CWallet::SpendZerocoin(CAmount nValue, int nSecurityLevel, CZerocoinSpendRe
         }
     }
 
-    receipt.SetStatus("Spend Successful", ZSPEND_OKAY);  // When we reach this point spending zPIV was successful
+    receipt.SetStatus("Spend Successful", ZSPEND_OKAY);
     return true;
 }
 
@@ -5939,7 +5961,7 @@ bool CWallet::CreateZOutPut(libzerocoin::CoinDenomination denomination, CTxOut& 
 }
 
 bool CWallet::CreateZerocoinMintTransaction(const CAmount nValue, CMutableTransaction& txNew,
-        std::vector<CDeterministicMint>& vDMints, CReserveKey* reservekey, int64_t& nFeeRet, std::string& strFailReason,
+        std::vector<CDeterministicMint>& vDMints, int64_t& nFeeRet, std::string& strFailReason,
         std::vector<CTempRecipient>& vecSend, OutputTypes inputtype, const CCoinControl* coinControl, const bool isZCSpendChange)
 {
     if (IsLocked()) {
@@ -6013,88 +6035,40 @@ bool CWallet::CreateZerocoinMintTransaction(const CAmount nValue, CMutableTransa
 
     CAmount nValueIn = 0;
     std::set<CInputCoin> setCoins;
-    if (inputtype == OUTPUT_STANDARD) {
-        /** select basecoin UTXO's to use**/
-        CCoinControl defaultCoinControl;
-        if (coinControl == NULL)
-            coinControl = &defaultCoinControl;
 
-        std::vector<COutput> vAvailableCoins;
-        AvailableCoins(vAvailableCoins, true, coinControl);
-        CoinSelectionParams coin_selection_params; // todo: set selection params
-        coin_selection_params.use_bnb = false;
-        bool fBool = true;
+    /** Select RingCT or CT Inputs **/
+    // create output variables for add anon inputs
+    CTransactionRef tx_new;
+    CWalletTx wtx(this, tx_new);
 
-        CCoinControl cControl;
-        if (coinControl)
-            cControl = *coinControl;
+    // protecting against nullptr dereference
+    CCoinControl cControl;
+    if (coinControl)
+        cControl = *coinControl;
 
-        if (!SelectCoins(vAvailableCoins, nTotalValue, setCoins, nValueIn, cControl, coin_selection_params, fBool)) {
-            strFailReason = "Insufficient confirmed funds, you might need to wait a few minutes and try again.";
+    CTransactionRecord rtx;
+    std::string sError;
+
+    if (inputtype == OUTPUT_RINGCT)  {
+        // default parameters for ring sig
+        if (0 != pAnonWalletMain->AddAnonInputs(wtx, rtx, vecSend, true, Params().DefaultRingSize(), /**nInputsPerSig**/ 32, nFeeRet, &cControl, sError)) {
+            strFailReason = strprintf("Failed to add ringctinputs: %s", sError);
             return false;
         }
-
-        // Fill vin
-        for (const CInputCoin& coin: setCoins)
-            txNew.vin.emplace_back(CTxIn(coin.outpoint.hash, coin.outpoint.n));
-
-        //any change that is less than 0.0100000 will be ignored and given as an extra fee
-        //also assume that a zerocoinspend that is minting the change will not have any change that goes to Piv
-        CAmount nChange = nValueIn - nTotalValue; // Fee already accounted for in nTotalValue
-
-        // Fill a vout to ourself using the largest contributing address
-        CScript scriptChange = GetLargestContributor(setCoins);
-        //add to the transaction
-        CTxOut outChange(nChange, scriptChange);
-        if (!IsDust(outChange, dustRelayFee)) {
-            txNew.vpout.emplace_back(outChange.GetSharedPtr());
-        } else {
-            if (reservekey)
-                reservekey->ReturnKey();
+    } else if (inputtype == OUTPUT_CT) {
+        if (0 != pAnonWalletMain->AddBlindedInputs(wtx, rtx, vecSend, true, nFeeRet, &cControl, sError)) {
+            strFailReason = strprintf("Failed to add ringctinputs: %s", sError);
+            return false;
         }
-
-        // Sign if these are basecoin outputs - NOTE that zerocoin outputs are signed later in SoK
-        int nIn = 0;
-        for (const CInputCoin& coin : setCoins) {
-            if (!SignSignature(*this, coin.txout.scriptPubKey, txNew, nIn++, coin.txout.nValue, SIGHASH_ALL)) {
-                strFailReason = "Signing transaction failed";
-                return false;
-            }
+    } else if (inputtype == OUTPUT_STANDARD) {
+        if (0 != pAnonWalletMain->AddStandardInputs(wtx, rtx, vecSend, true, nFeeRet, &cControl, sError, /*fZerocoinInputs*/false, /*InputValue*/0)) {
+            strFailReason = strprintf("Failed to add basecoin inputs: %s", sError);
+            return false;
         }
-
-        return true;
-    } else {
-        /** Select RingCT or CT Inputs **/
-        // create output variables for add anon inputs
-        CTransactionRef tx_new;
-        CWalletTx wtx(this, tx_new);
-
-        // protecting against nullptr dereference
-        CCoinControl cControl;
-        if (coinControl)
-            cControl = *coinControl;
-
-        CTransactionRecord rtx;
-        std::string sError;
-
-        if (inputtype == OUTPUT_RINGCT)  {
-            // default parameters for ring sig
-            if (0 != pAnonWalletMain->AddAnonInputs(wtx, rtx, vecSend, true, Params().DefaultRingSize(), /**nInputsPerSig**/ 32, nFeeRet, &cControl, sError)) {
-                strFailReason = strprintf("Failed to add ringctinputs: %s", sError);
-                return false;
-            }
-        } else if (inputtype == OUTPUT_CT) {
-            if (0 != pAnonWalletMain->AddBlindedInputs(wtx, rtx, vecSend, true, nFeeRet, &cControl, sError)) {
-                strFailReason = strprintf("Failed to add ringctinputs: %s", sError);
-                return false;
-            }
-        }
-
-        txNew = CMutableTransaction(*wtx.tx);
-        return true;
     }
 
-    return false;
+    txNew = CMutableTransaction(*wtx.tx);
+    return true;
 }
 
 bool CWallet::CollectMintsForSpend(CAmount nValue, std::vector<CZerocoinMint>& vMints, CZerocoinSpendReceipt& receipt, int nStatus, bool fMinimizeChange, libzerocoin::CoinDenomination denomFilter)
@@ -6144,6 +6118,9 @@ bool CWallet::CollectMintsForSpend(CAmount nValue, std::vector<CZerocoinMint>& v
         }
     }
 
+    // order the list of mints - oldest first
+    listMints.sort(oldest_first);
+
     int nCoinsReturned, nNeededSpends;
     CAmount nValueSelected;
     auto vMintsToFetch = SelectMintsFromList(nValueToSelect, nValueSelected, Params().Zerocoin_MaxSpendsPerTransaction(),
@@ -6162,7 +6139,7 @@ bool CWallet::CollectMintsForSpend(CAmount nValue, std::vector<CZerocoinMint>& v
 }
 
 bool CWallet::CreateZerocoinSpendTransaction(CAmount nValue, int nSecurityLevel, CWalletTx& wtxNew,
-        CReserveKey& reserveKey, CZerocoinSpendReceipt& receipt, std::vector<CZerocoinMint>& vSelectedMints,
+        CZerocoinSpendReceipt& receipt, std::vector<CZerocoinMint>& vSelectedMints,
         std::vector<CDeterministicMint>& vNewMints, bool fMintChange,  bool fMinimizeChange, CTxDestination* address)
 {
     int nStatus = ZTRX_FUNDS_PROBLEMS;
@@ -6270,12 +6247,6 @@ bool CWallet::CreateZerocoinSpendTransaction(CAmount nValue, int nSecurityLevel,
                     vecSend.emplace_back(r);
                 } else {
                     scriptZerocoinSpend = GetScriptForDestination(*address);
-//                    if (nChange) {
-//                        // Reserve a new key pair from key pool
-//                        CPubKey vchPubKey;
-//                        assert(reserveKey.GetReservedKey(vchPubKey)); // should never fail
-//                        scriptChange = GetScriptForDestination(vchPubKey.GetID());
-//                    }
                 }
             }
 
@@ -6319,8 +6290,8 @@ bool CWallet::CreateZerocoinSpendTransaction(CAmount nValue, int nSecurityLevel,
                     //mint change as zerocoins and RingCT
                     CAmount nFeeRet = 0;
                     std::string strFailReason = "";
-                    if (!CreateZerocoinMintTransaction(nChangeRemint, txNew, vNewMints, &reserveKey, nFeeRet,
-                                                       strFailReason, vecSend, /*inputtype*/OUTPUT_STANDARD, nullptr, true)) {
+                    if (!CreateZerocoinMintTransaction(nChangeRemint, txNew, vNewMints, nFeeRet, strFailReason, vecSend,
+                            /*inputtype*/OUTPUT_STANDARD, nullptr, true)) {
                         receipt.SetStatus("Failed to create mint", nStatus);
                         return false;
                     }
@@ -6352,7 +6323,6 @@ bool CWallet::CreateZerocoinSpendTransaction(CAmount nValue, int nSecurityLevel,
                 if (0 != pAnonWalletMain->AddStandardInputs(wtxNew, rtx, vecSend, false, nFeeRet, &coinControl, sError, true, nValueSelected)) {
                     receipt.SetStatus("Failed to add standard inputs", nStatus);
                     return error("%s: AddStandardInputs failed: %s", __func__, sError);
-
                 }
 
                 pAnonWalletMain->AddOutputRecordMetaData(rtx, vecSend);
