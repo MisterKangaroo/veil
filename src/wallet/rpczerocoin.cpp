@@ -584,6 +584,7 @@ UniValue listzerocoinamounts(const JSONRPCRequest& request)
         auto denom = mi.first;
         val.push_back(Pair("denomination", libzerocoin::ZerocoinDenominationToInt(denom)));
         val.push_back(Pair("mints_spendable", (int64_t)mi.second));
+        val.push_back(Pair("mints_stakeable", (int64_t)nConfirmations>=200));
         val.push_back(Pair("mints_pending", (int64_t)pZerocoinDist.second.at(denom)));
         ret.push_back(val);
     }
